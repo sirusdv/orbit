@@ -32,6 +32,7 @@ import com.ea.orbit.actors.IActorObserver;
 import com.ea.orbit.concurrent.Task;
 
 import java.io.Serializable;
+import java.util.Map;
 import java.util.Set;
 
 public interface IHosting extends IActorObserver
@@ -45,12 +46,14 @@ public interface IHosting extends IActorObserver
     {
         private NodeTypeEnum type;
         private Set<String> availableActors;
+        private Map<String, Long> actorActivationLimits;
 
         @java.beans.ConstructorProperties({"type", "availableActors"})
-        public StageInfo(final NodeTypeEnum type, final Set<String> availableActors)
+        public StageInfo(final NodeTypeEnum type, final Set<String> availableActors, final Map<String, Long> actorActivationLimits)
         {
             this.type = type;
             this.availableActors = availableActors;
+            this.actorActivationLimits = actorActivationLimits;
         }
 
         public NodeTypeEnum getType()
@@ -61,6 +64,10 @@ public interface IHosting extends IActorObserver
         public Set<String> getAvailableActors()
         {
             return this.availableActors;
+        }
+
+        public Map<String, Long> getActorActivationLimits() {
+            return actorActivationLimits;
         }
 
         public String toString()

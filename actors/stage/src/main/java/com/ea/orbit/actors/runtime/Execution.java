@@ -44,6 +44,7 @@ import com.ea.orbit.exception.UncheckedException;
 import com.ea.orbit.util.ClassPath;
 import com.ea.orbit.util.IOUtils;
 
+import com.fasterxml.jackson.databind.util.ClassUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,17 +52,7 @@ import com.google.common.collect.MapMaker;
 
 import java.lang.ref.WeakReference;
 import java.time.Clock;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -79,6 +70,7 @@ public class Execution implements IRuntime
     private static final Logger logger = LoggerFactory.getLogger(Execution.class);
     private Map<Class<?>, InterfaceDescriptor> descriptorMapByInterface = new HashMap<>();
     private Map<Integer, InterfaceDescriptor> descriptorMapByInterfaceId = new HashMap<>();
+    private Map<InterfaceDescriptor, Set<ActivationReservation>> reservations = new HashMap<>();
     private Map<EntryKey, ReferenceEntry> localActors = new ConcurrentHashMap<>();
     private Map<EntryKey, IActorObserver> observerInstances = new MapMaker().weakValues().makeMap();
     // from implementation to reference
@@ -97,10 +89,14 @@ public class Execution implements IRuntime
     private AtomicLong refusedExecutions = new AtomicLong();
     private ExecutorService executor;
 
+    @Config("orbit.actors.reservation.timeout")
+    private long reservationTimeout = 2_000;
+
     @Config("orbit.actors.autoDiscovery")
     private boolean autoDiscovery = true;
     private List<Class<?>> actorClasses = new ArrayList<>();
     private List<String> availableActors;
+    private Map<String, Long> activationLimits = new HashMap<>();
     private final WeakReference<IRuntime> cachedRef = new WeakReference<>(this);
 
     public Execution()
@@ -124,6 +120,56 @@ public class Execution implements IRuntime
         return executor;
     }
 
+    public boolean checkReservation(INodeAddress to, String interfaceClassName) {
+
+        Class<?> clazz = null;
+        try
+        {
+            clazz = Class.forName(interfaceClassName);
+        }
+        catch (ClassNotFoundException e)
+        {
+            throw new UncheckedException(e);
+        }
+
+        int interfaceId = getDescriptor(clazz).factory.getInterfaceId();
+
+        try
+        {
+            return ((Task<Boolean>)messaging.sendReserveActivationRequest(to, interfaceId)).get();
+        }
+        catch (ExecutionException | InterruptedException e)
+        {
+            return false;
+        }
+    }
+
+    public void onActivationReservation(INodeAddress from, int messageId, int interfaceId) {
+        InterfaceDescriptor interfaceDescriptor = getDescriptor(interfaceId);
+        long localActorCount = localActors.keySet().stream()
+                .filter(entryKey -> entryKey.interfaceId == interfaceId).count();
+
+        if(!reservations.containsKey(interfaceDescriptor))
+        {
+            reservations.put(interfaceDescriptor, new HashSet<>());
+        }
+
+        long activeReservations = reservations.get(interfaceDescriptor).size();
+
+        long limit = getActorActivationLimits().getOrDefault(interfaceDescriptor.concreteClassName, Long.MAX_VALUE);
+
+        if(localActorCount + activeReservations < limit)
+        {
+            ActivationReservation reservation = new ActivationReservation();
+            reservation.expires = clock.millis() + reservationTimeout;
+            reservation.from = from;
+            reservation.messageId = messageId;
+            reservations.get(interfaceDescriptor).add(reservation);
+        }
+
+        messaging.sendResponse(from, 1, messageId, localActorCount + activeReservations < limit);
+    }
+
     private static class InterfaceDescriptor
     {
         ActorFactory factory;
@@ -136,6 +182,12 @@ public class Execution implements IRuntime
         {
             return this.concreteClassName;
         }
+    }
+
+    private static class ActivationReservation {
+        INodeAddress from;
+        int messageId;
+        long expires;
     }
 
     private class ReferenceEntry
@@ -387,8 +439,6 @@ public class Execution implements IRuntime
         }
     }
 
-    private Map<IAddressable, ReferenceEntry> actors;
-
 
     public void setProviders(List<IOrbitProvider> providers)
     {
@@ -415,9 +465,19 @@ public class Execution implements IRuntime
         this.hosting = hosting;
     }
 
+    public Hosting getHosting()
+    {
+        return this.hosting;
+    }
+
     public void setMessaging(final Messaging messaging)
     {
         this.messaging = messaging;
+    }
+
+    public Messaging getMessaging()
+    {
+        return this.messaging;
     }
 
     public Task stop()
@@ -718,6 +778,15 @@ public class Execution implements IRuntime
             {
                 entry.statelessActivations = new ConcurrentLinkedDeque<>();
             }
+
+            //check to see if this is from a reservation.
+            if(reservations.containsKey(descriptor))
+            {
+                //Remove the first found reservation from endoint
+                reservations.get(descriptor).stream().filter(reservation -> reservation.from.equals(from)).findFirst()
+                        .ifPresent(reservation -> reservations.get(descriptor).remove(reservation));
+            }
+
             entry.reference = (ActorReference) descriptor.factory.createReference(key != null ? String.valueOf(key) : null);
             entry.reference.runtime = this;
             entry.removable = true;
@@ -938,6 +1007,12 @@ public class Execution implements IRuntime
                 }
             }
         }
+
+            for(InterfaceDescriptor id : reservations.keySet()) {
+                long ticks = clock.millis();
+                reservations.put(id, reservations.get(id).stream().filter(reservation -> reservation.expires < ticks).collect(Collectors.toSet()));
+            }
+
         if (block)
         {
             Task.allOf(futures).join();
@@ -962,5 +1037,9 @@ public class Execution implements IRuntime
     public List<String> getAvailableActors()
     {
         return availableActors;
+    }
+
+    public Map<String, Long> getActorActivationLimits() {
+        return activationLimits;
     }
 }

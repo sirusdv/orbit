@@ -113,7 +113,9 @@ public class Hosting implements IHosting, Startable
     public Task<StageInfo> getNodeType()
     {
         return Task.fromValue(new StageInfo(nodeType,
-                nodeType == NodeTypeEnum.CLIENT ? new HashSet<>() : new HashSet<>(execution.getAvailableActors())));
+                nodeType == NodeTypeEnum.CLIENT ? new HashSet<>() : new HashSet<>(execution.getAvailableActors())
+        ,execution.getActorActivationLimits()
+        ));
     }
 
     public void setClusterPeer(final IClusterPeer clusterPeer)
@@ -209,7 +211,7 @@ public class Hosting implements IHosting, Startable
         final String interfaceClassName = interfaceClass.getName();
         if (interfaceClass.isAnnotationPresent(StatelessWorker.class))
         {
-            if (nodeType == NodeTypeEnum.SERVER && execution.getAvailableActors().contains(interfaceClassName))
+            if (nodeType == NodeTypeEnum.SERVER && execution.getAvailableActors().contains(interfaceClassName)) //XXX: ADD LOCAL LOCALITY CHECK
             {
                 // TODO: consider always using local instance if this node is a server
                 // ~90% chance of making a local call
@@ -272,14 +274,17 @@ public class Hosting implements IHosting, Startable
 
     private INodeAddress selectNode(final String interfaceClassName, boolean allowToBlock)
     {
-        final INodeAddress nodeAddress;
+        NodeInfo selectedNode = null;
         List<NodeInfo> potentialNodes;
         List<NodeInfo> currentServerNodes = serverNodes;
         long start = System.currentTimeMillis();
         do
         {
             potentialNodes = currentServerNodes.stream()
+                    //make sure that the server node supports activating the interface.
                     .filter(n -> n.server && n.stageInfo != null && n.stageInfo.getAvailableActors().contains(interfaceClassName))
+                    //if we are not allowed to block make sure that the node does not have activation limits.
+                    .filter(n -> allowToBlock || !n.stageInfo.getActorActivationLimits().containsKey(interfaceClassName))
                     .collect(Collectors.toList());
             if (potentialNodes.size() == 0)
             {
@@ -309,9 +314,31 @@ public class Hosting implements IHosting, Startable
                     currentServerNodes = serverNodes;
                 }
             }
+            else
+            {
+                selectedNode = potentialNodes.get(random.nextInt(potentialNodes.size()));
+
+                //check to see if the selected node does not contains activation limit for this class.
+                if(!selectedNode.stageInfo.getActorActivationLimits().containsKey(interfaceClassName))
+                {
+                    break;
+                }
+
+                //Ask the node if it can support more limits and perform activation
+                if(!execution.checkReservation(selectedNode.address, interfaceClassName))
+                {
+                    potentialNodes.clear();
+                }
+                else
+                {
+                    //At this point the selected node is considered good!
+                    break;
+                }
+            }
+
         } while (potentialNodes.size() == 0);
-        nodeAddress = potentialNodes.get(random.nextInt(potentialNodes.size())).address;
-        return nodeAddress;
+
+        return selectedNode != null ? selectedNode.address : null;
     }
 
     @Deprecated

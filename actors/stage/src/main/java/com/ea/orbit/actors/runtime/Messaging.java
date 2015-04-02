@@ -31,6 +31,7 @@ package com.ea.orbit.actors.runtime;
 import com.ea.orbit.actors.IActorObserver;
 import com.ea.orbit.actors.cluster.IClusterPeer;
 import com.ea.orbit.actors.cluster.INodeAddress;
+import com.ea.orbit.annotation.Config;
 import com.ea.orbit.concurrent.ExecutorUtils;
 import com.ea.orbit.concurrent.Task;
 import com.ea.orbit.container.Startable;
@@ -70,7 +71,13 @@ public class Messaging implements Startable
     private Map<Integer, PendingResponse> pendingResponseMap = new ConcurrentHashMap<>();
     private PriorityBlockingQueue<PendingResponse> pendingResponsesQueue = new PriorityBlockingQueue<>();
     private Clock clock = Clock.systemUTC();
+
+    @Config("orbit.actors.reservation.responsetimeout")
+    private long reservationResponseTimeout = 1_000;
+
+    @Config("orbit.actors.timeout")
     private long responseTimeoutMillis = 30_000;
+
     private AtomicLong networkMessagesReceived = new AtomicLong();
     private AtomicLong objectMessagesReceived = new AtomicLong();
     private AtomicLong responsesReceived = new AtomicLong();
@@ -86,10 +93,17 @@ public class Messaging implements Startable
         this.clusterPeer = clusterPeer;
     }
 
+    public IClusterPeer getClusterPeer()
+    {
+        return clusterPeer;
+    }
+
     public INodeAddress getNodeAddress()
     {
         return clusterPeer.localAddress();
     }
+
+
 
     private static class PendingResponse extends Task implements Comparable<PendingResponse>
     {
@@ -171,6 +185,7 @@ public class Messaging implements Startable
             {
                 case 0:
                 case 8:
+                {
                     boolean oneway = (messageType == 8);
                     objectMessagesReceived.incrementAndGet();
                     int interfaceId = in.readInt();
@@ -179,6 +194,7 @@ public class Messaging implements Startable
                     Object[] params = (Object[]) in.readObject();
                     execution.onMessageReceived(from, oneway, messageId, interfaceId, methodId, key, params);
                     break;
+                }
                 case 1:
                 case 2:
                 case 3:
@@ -226,6 +242,12 @@ public class Messaging implements Startable
                     }
                     break;
                 }
+                case 10: //Check activation limit and activate node if possible.
+                {
+                    int interfaceId = in.readInt();
+                    execution.onActivationReservation(from, messageId, interfaceId);
+                    break;
+                }
                 default:
                     logger.error("Illegal protocol, invalid message type: {}", messageId);
                     return;
@@ -242,6 +264,32 @@ public class Messaging implements Startable
         // could be used to decrease the timeout of messages sent to failed nodes.
     }
 
+
+    public Task<?> sendReserveActivationRequest(INodeAddress to, int interfaceId)
+    {
+        int messageId = messageIdGen.incrementAndGet();
+        try(ByteArrayOutputStream bos = new ByteArrayOutputStream(); ObjectOutput objectOutput = createObjectOutput(bos))
+        {
+            objectOutput.writeByte(10); //messageType
+            objectOutput.writeInt(messageId); //messageId
+            objectOutput.writeInt(interfaceId);
+            objectOutput.flush();
+
+            clusterPeer.sendMessage(to, bos.toByteArray());
+
+            PendingResponse pendingResponse = new PendingResponse();
+            pendingResponse.messageId = messageId;
+            pendingResponse.timeoutAt = clock.millis() + reservationResponseTimeout;
+            pendingResponseMap.put(messageId, pendingResponse);
+            pendingResponsesQueue.add(pendingResponse);
+
+            return pendingResponse;
+        }
+        catch (IOException e)
+        {
+            throw new UncheckedException(e);
+        }
+    }
 
     public void sendResponse(INodeAddress to, int messageType, int messageId, Object res)
     {
