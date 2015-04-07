@@ -34,6 +34,7 @@ import com.ea.orbit.actors.IAddressable;
 import com.ea.orbit.actors.annotation.StatelessWorker;
 import com.ea.orbit.actors.cluster.IClusterPeer;
 import com.ea.orbit.actors.cluster.INodeAddress;
+import com.ea.orbit.actors.cluster.IReservationProvider;
 import com.ea.orbit.annotation.Config;
 import com.ea.orbit.concurrent.Task;
 import com.ea.orbit.container.Startable;
@@ -58,11 +59,11 @@ public class Hosting implements IHosting, Startable
     private static final Logger logger = LoggerFactory.getLogger(Hosting.class);
     private NodeTypeEnum nodeType;
     private IClusterPeer clusterPeer;
-
     private volatile Map<INodeAddress, NodeInfo> activeNodes = new HashMap<>(0);
     private volatile List<NodeInfo> serverNodes = new ArrayList<>(0);
     private final Object serverNodesUpdateMutex = new Object();
     private Execution execution;
+    private IReservationProvider reservation;
     private ConcurrentMap<IAddressable, INodeAddress> localAddressCache = new ConcurrentHashMap<>();
     private volatile ConcurrentMap<IAddressable, INodeAddress> distributedDirectory;
     @Config("orbit.actors.timeToWaitForServersMillis")
@@ -99,6 +100,7 @@ public class Hosting implements IHosting, Startable
         boolean active;
         INodeAddress address;
         IHosting hosting;
+        IReservationProvider reservation;
         boolean cannotHostActors;
         final ConcurrentHashMap<String, Integer> canActivate = new ConcurrentHashMap<>();
 
@@ -124,6 +126,23 @@ public class Hosting implements IHosting, Startable
     public Task<Void> start()
     {
         clusterPeer.registerViewListener(v -> onClusterViewChanged(v));
+
+
+        reservation = execution.getFirstProvider(IReservationProvider.class);
+
+        if(reservation == null)
+        {
+            reservation = new IReservationProvider()
+            {
+                @Override
+                public Task<Boolean> tryReservation(String interfaceClassName)
+                {
+                    return Task.fromValue(true);
+                }
+            };
+        }
+
+        execution.createObjectReference(IReservationProvider.class, reservation, "");
         return Task.done();
     }
 
@@ -139,6 +158,7 @@ public class Hosting implements IHosting, Startable
             {
                 nodeInfo = new NodeInfo(a);
                 nodeInfo.hosting = execution.createReference(a, IHosting.class, "");
+                nodeInfo.reservation = execution.createReference(a, IReservationProvider.class, "");
                 nodeInfo.active = true;
                 activeNodes.put(a, nodeInfo);
                 justAddedNodes.add(nodeInfo);
@@ -311,7 +331,7 @@ public class Hosting implements IHosting, Startable
                         continue;
                     }
                 }
-                if (canActivate == actorSupported_yes)
+                if (canActivate == actorSupported_yes && nodeInfo.reservation.tryReservation(interfaceClassName).join())
                 {
                     return nodeInfo.address;
                 }

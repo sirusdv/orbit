@@ -495,7 +495,7 @@ public class Execution implements IRuntime
     }
 
     @SuppressWarnings("unchecked")
-    private <T extends IActorObserver> T createObjectReference(final Class<T> iClass, final T observer, String objectId)
+    <T extends IActorObserver> T createObjectReference(final Class<T> iClass, final T observer, String objectId)
     {
 
         ActorFactory<?> factory;
